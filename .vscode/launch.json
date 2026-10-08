@@ -1,0 +1,44 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "J-Link SWD STM32F446 (Flash&Debug)",
+      "type": "cortex-debug",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+
+      /* ---------- 目标 / 固件 ----------
+       * 工程根目录本身就是 CMake 的构建树(生成器: MinGW Makefiles),
+       * lora_master.elf / lora_master.map 直接落在工程根目录。
+       *
+       * device 必须用 J-Link 设备库里的名字: 实测 "STM32F446RET6" 会报
+       * "Failed to get index for device name", 要用 "STM32F446RE"。 */
+      "device": "STM32F446RE",
+      "interface": "swd",
+      "executable": "${workspaceFolder}/lora_master.elf",
+      "runToEntryPoint": "main",
+
+      /* ---------- 调试后端: J-Link GDB Server ---------- */
+      "servertype": "jlink",
+      // 本机实测路径(同时也在 PATH 中);换机器或升级 J-Link 后改这里
+      "serverpath": "D:/Program Files/SEGGER/JLink_V948/JLinkGDBServerCL.exe",
+      "serverArgs": ["-speed", "4000"],
+
+      /* ---------- GNU 工具链 ----------
+       * 需包含 arm-none-eabi-gdb / nm / objdump,该目录下已确认都有 */
+      "armToolchainPath": "D:/UserDev/UserTOOL/arm-gnu-toolchain/bin",
+
+      /* ---------- 构建 ----------
+       * F5 前先执行 tasks.json 里的 build,避免调试到上一次的旧 elf */
+      "preLaunchTask": "Build (make)",
+
+      /* ---------- 外设寄存器视图(可选) ----------
+       * 工程内目前没有 SVD 文件;拿到 STM32F446RE 的 .svd 后取消注释即可 */
+      // "svdFile": "${workspaceFolder}/STM32F446RE.svd"
+
+      /* ---------- 排查连接问题(需要时取消注释) ----------
+       * 可选值: "raw" / "parsed" / "both" / "vscode" */
+      // "showDevDebugOutput": "parsed"
+    }
+  ]
+}

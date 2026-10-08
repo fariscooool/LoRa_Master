@@ -1,0 +1,32 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      /* 与 launch.json 的 "preLaunchTask": "Build (make)" 对应。
+       *
+       * 工程根目录就是 CMake 生成的构建树(生成器: MinGW Makefiles,
+       * CMAKE_MAKE_PROGRAM = CodeBlocks 自带的 mingw32-make),
+       * 所以直接在这里跑 make 即可,产物落在 ${workspaceFolder}/lora_master.elf。
+       *
+       * 注意: CMakePresets.json 里配的是 Ninja + build/${presetName},
+       * 和当前实际构建树不一致;若以后改用预设构建,这里要同步改。 */
+      "label": "Build (make)",
+      "type": "shell",
+      "command": "make",
+      "args": ["-j"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gcc"],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared",
+        "clear": true
+      }
+    }
+  ]
+}
