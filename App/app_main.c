@@ -11,6 +11,7 @@
 
 #include "app_main.h"
 #include "app_lora_procotol.h"
+#include "app_lora_config.h"
 
 #include "app_lora.h"
 #include "bsp_uart.h"
@@ -56,7 +57,7 @@ void app_init(void)
 
     lora_cfg_t = lora_cfg;
 
-    g_cfg_ok = app_lora_cfg_reg_verify(lora_cfg_t, sizeof(lora_cfg_t.data));
+    g_cfg_ok = app_lora_cfg_reg_verify(lora_cfg_t);
 
     log_i("LoRa configuration %s", g_cfg_ok ? "successful" : "failed");
 }

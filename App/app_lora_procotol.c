@@ -1,9 +1,10 @@
 /**
  * @file app_lora_procotol.c
  * @author Fariscooool (fariscooool@gmail.com)
- * @brief LoRa 协议处理:数据拆包解析 / 装包发送(待自己实现)
- * @version 0.1
- * @date 2026-09-16
+ * @brief LoRa 协议 v1.5 主机侧实现:上行帧解析、按设备建表、ACK 应答、点名命令
+ *        (样机阶段 ACK 由 APP_LORA_ACK_ENABLE 关闭,只做接收)
+ * @version 0.2
+ * @date 2026-10-09
  * 
  * @copyright Copyright (c) 2026
  * 
@@ -20,48 +21,9 @@
 #include "main.h"
 #include "LOG.h"
 
-/* 自定义帧格式(收发一致,与现有发送函数保持一致):
- *   [0]      0x5A
- *   [1]      LEN  = 整帧字节数(含帧头与 CRC)
- *   [2]      FUN  功能码
- *   [3..]    DATA 数据域,长度 = LEN - 4
- *   [LEN-1]  CRC8 (对 [0..LEN-2] 计算,多项式 0x07)
- * 举例:心跳帧 0x5A 0x04 0x00 0xF7
+/* 帧格式与协议常量定义见 app_lora_procotol.h(与 LoRa_Protocol_v1.5.md 一致):
+ *   [0] HEAD=0x5A  [1] ADDR  [2] LEN  [3] FUN  [4..LEN-2] DATA  [LEN-1] CRC8
  */
-#define LORA_FRAME_HEAD     0x5A
-#define LORA_FRAME_MIN_LEN  4U      /* 头+长度+FUN+CRC(数据域为空) */
-#define LORA_FRAME_DATA_MAX 12U     /* 数据域上限 */
-#define LORA_FRAME_BUF_MAX  (LORA_FRAME_MIN_LEN + LORA_FRAME_DATA_MAX)
-#define LORA_FRAME_GAP_MS   50U     /* 字节间超时:超时则丢弃半帧 */
-
-/* 上行(设备 -> 主机)功能码 */
-#define LORA_FUN_HEARTBEAT 0x00     // 心跳帧
-#define LORA_FUN_SIGNAL 0x01        // 信号帧，主要是ABC相开关状态
-#define LORA_FUN_POWER 0x02         // 电池电量帧
-
-/* 下行(主机 -> 设备)功能码:控制参数 */
-#define LORA_FUN_GET_POWER   0x10U  /* 数据 0B:获取电池电量*/
-#define LORA_FUN_GET_SIGNAL   0x11U  /* 数据 1B:主动获取ABC相开关状态*/
-// #define LORA_FUN_SET_ADDR     0x12U  /* 数据 2B:模块地址(小端,掉电保存)  */
-// #define LORA_FUN_SET_CHANNEL  0x13U  /* 数据 1B:模块信道(掉电保存)       */
-// #define LORA_FUN_QUERY_CFG    0x14U  /* 数据 0B:请求回读当前配置         */
-
-#define LORA_CFG_CMD_WRITE  0xC0U   /* 写寄存器(掉电保存);临时写可改 0xC2 */
-#define LORA_CFG_CMD_READ   0xC1U   /* 读参数 */
-
-#define LORA_CFG_SWITCH_MS  20U     /* 模式切换后等待模块稳定(ms) */
-#define LORA_CFG_READY_MS   100U    /* 等 AUX 就绪的超时(ms) */
-#define LORA_CFG_REPLY_MS   300U    /* 等配置回包的超时(ms) */
-
-/* 单次配置读/写的最大数据字节数 */
-#define APP_LORA_CFG_DATA_MAX   5U
-
-/* 厂商回包长度上限:C1C1C1 回显(最多 3 字节) + 5 字节参数 */
-#define LORA_CFG_REPLY_MAX      (3U + APP_LORA_CFG_DATA_MAX)
-/* 收到第一个字节后,总线静默超过这个时间就认为回包收完
- * (各版本固件回包长度不一:有的回 C1+5 字节,有的回 C1C1C1+5 字节) */
-#define LORA_CFG_REPLY_GAP_MS   20U
-
 
 /*********************************
  * 静态函数
@@ -88,258 +50,172 @@ static uint8_t lora_crc8_cal(const uint8_t *data, uint16_t len)
     return crc;
 }
 
-/* 清空接收 FIFO 残留(交易前后用) */
-static void lora_cfg_flush_rx(void)
+/*==============================================================================
+ * 主机侧:设备状态表 + ACK 应答 + 点名命令(§5 / §8)
+ *============================================================================*/
+
+static app_lora_dev_t s_dev[APP_LORA_DEV_MAX];
+
+/* 查找设备条目;不存在则在空槽新建(表满返回 NULL) */
+static app_lora_dev_t *lora_dev_get(uint8_t addr)
 {
-    uint8_t b;
-
-    while (app_lora_read_byte(&b) != 0U)
-    {
-        /* 丢弃 */
-    }
-}
-
-/*********************************
- * 一、配置包打包以及接收
- * 亿佰特 E22/E220 系列芯片配置参数需要在休眠模式下:
- *   写: C0 + 5字节工作参数，共6字节（掉电保存）
- *   读: 主机发：C1C1C1 模块回：已配置的参数.
- *       主机发：C3C3C3 模块回：版本信息
- *       主机发：C4C4C4 模块复位
- *********************************/
-/* 进入配置模式:切 M0/M1 + 等模块稳定 + 等 AUX 就绪 */
-static void lora_cfg_mode_enter(void)
-{
-    uint32_t t0;
-
-    app_lora_set_mode(LORA_MODE_SLEEP);         /* M1=1,M0=1:配置模式 */
-    HAL_Delay(LORA_CFG_SWITCH_MS);
-
-    /* 空闲时 AUX 为高;超时也继续,按最快路径尝试 */
-    t0 = HAL_GetTick();
-    while ((bsp_gpio_read(BSP_LORA_AUX) == BSP_GPIO_LOW) &&
-           ((HAL_GetTick() - t0) < LORA_CFG_READY_MS))
-    {
-        HAL_Delay(1U);
-    }
-}
-
-/* 退出配置模式:切回正常传输模式
- * ⚠ 这一句不能省:休眠(配置)模式下模块射频是关的,收不到任何空中数据,
- *   串口也不会有输出(表现为 USART6/DMA 中断永远不进)。 */
-static void lora_cfg_mode_exit(void)
-{
-    app_lora_set_mode(LORA_MODE_NORMAL);
-    HAL_Delay(LORA_CFG_SWITCH_MS);
-}
-
-/* 发一帧厂商帧并尽量把回包收下来。
- * 厂商回包长度随固件版本而异(6 字节 C1+5参数,或 8 字节 C1C1C1+5参数),
- * 所以不按固定长度等,而是“收到第一个字节后等总线静默”来判帧尾。
- * @retval 实际收到的字节数(0 = 一个字节都没收到) */
-static uint8_t lora_cfg_transaction(uint8_t *tx, uint8_t tx_len,
-                                    uint8_t *rx, uint8_t rx_cap)
-{
-    uint32_t t0;
-    uint32_t tlast;
-    uint8_t  got = 0U;
-
-    lora_cfg_flush_rx();
-    app_lora_send_bytes(tx, tx_len);
-
-    if ((rx == NULL) || (rx_cap == 0U))
-    {
-        return 0U;
-    }
-
-    t0 = tlast = HAL_GetTick();
-    while ((HAL_GetTick() - t0) < LORA_CFG_REPLY_MS)
-    {
-        if ((got < rx_cap) && (app_lora_read_byte(&rx[got]) != 0U))
-        {
-            got++;
-            tlast = HAL_GetTick();   /* 每收到一个字节续期,容忍慢回包 */
-            continue;
-        }
-
-        if ((got > 0U) && ((HAL_GetTick() - tlast) >= LORA_CFG_REPLY_GAP_MS))
-        {
-            break;                   /* 有回包且已静默 -> 一帧收完 */
-        }
-    }
-
-    if (got == 0U)
-    {
-        log_e("cfg: no reply within %u ms", (unsigned)LORA_CFG_REPLY_MS);
-    }
-
-    return got;
-}
-
-uint8_t app_lora_cfg_write(lora_reg_parm_cfg_t cfg, uint8_t len)
-{
-    uint8_t tx[1U + APP_LORA_CFG_DATA_MAX];
-    uint8_t ok = 0U;
     uint8_t i;
+    app_lora_dev_t *slot = NULL;
 
-    if ((len == 0U) || (len > APP_LORA_CFG_DATA_MAX))
+    for (i = 0U; i < APP_LORA_DEV_MAX; i++)
     {
-        return 0U;
-    }
-
-    tx[0] = LORA_CFG_CMD_WRITE;
-
-    for (i = 0U; i < len; i++)
-    {
-        tx[1U + i] = cfg.data[i];
-    }
-
-    lora_cfg_mode_enter();
-    /* 写指令:有的固件会回显(C0 + 参数),有的不回;不管哪种都读进来打印,
-     * 方便对照。写是否真正生效由 app_lora_cfg_reg_verify() 的读回比对判定。 */
-    {
-        uint8_t echo[LORA_CFG_REPLY_MAX];
-
-        (void)lora_cfg_transaction(tx, (uint8_t)(1U + len), echo, (uint8_t)sizeof(echo));
-    }
-    ok = 1U;
-    lora_cfg_mode_exit();
-
-    return ok;
-}
-
-
-uint8_t app_lora_cfg_read(lora_reg_parm_cfg_t *buf, uint8_t len)
-{
-    uint8_t tx[3U];
-    /* 回包:开头是命令回显(1~3 个 0xC1),后面才是 5 字节参数 */
-    uint8_t rx[LORA_CFG_REPLY_MAX];
-    uint8_t got = 0U;
-    uint8_t n_cmd = 0U;
-    uint8_t ok = 0U;
-    uint8_t i;
-
-    if ((buf == NULL) || (len == 0U) || (len > APP_LORA_CFG_DATA_MAX))
-    {
-        return 0U;
-    }
-
-    tx[0] = LORA_CFG_CMD_READ;
-    tx[1] = LORA_CFG_CMD_READ;
-    tx[2] = LORA_CFG_CMD_READ;
-
-    lora_cfg_mode_enter();
-
-    got = lora_cfg_transaction(tx, 3U, rx, (uint8_t)sizeof(rx));
-
-    /* 跳过开头的命令回显字节(0xC1),剩下的就是参数 */
-    while ((n_cmd < got) && (rx[n_cmd] == LORA_CFG_CMD_READ))
-    {
-        n_cmd++;
-    }
-
-    if ((uint8_t)(got - n_cmd) >= len)
-    {
-        for (i = 0U; i < len; i++)
+        if (s_dev[i].used != 0U)
         {
-            buf->data[i] = rx[n_cmd + i];
-        }
-        ok = 1U;
-    }
-    else
-    {
-        log_e("cfg read: bad reply (got %d bytes, %d cmd echo)", got, n_cmd);
-    }
-
-    lora_cfg_mode_exit();
-
-    return ok;
-}
-
-/**
- * @brief 一次配置模式下完成 "写 + 读回" 并比对
- * @retval 1=写回显与读回都一致 0=失败
- */
-static uint8_t lora_cfg_write_read_verify(const lora_reg_parm_cfg_t val, uint8_t len)
-{
-    uint8_t tx[1U + APP_LORA_CFG_DATA_MAX];
-    lora_reg_parm_cfg_t rd;
-    uint8_t ok = 0U;
-    uint8_t i;
-
-    if (len != 5U)
-    {
-        return 0U;
-    }
-
-    lora_cfg_mode_enter();
-
-    /* 1) 写:模块应原样回显 */
-    tx[0] = LORA_CFG_CMD_WRITE;
-    for (i = 0U; i < len; i++)
-    {
-        tx[1U + i] = val.data[i];
-    }
-    if (lora_cfg_transaction(tx, (uint8_t)(1U + len), NULL, 0) != 0U)
-    {
-        ok = 1U;
-    }
-
-    /* 2) 读回数据,解析后与期望值逐个比对 */
-    if(app_lora_cfg_read(&rd, (uint8_t)sizeof(rd.data)) != 0U)
-    {
-        for (i = 0U; i < len; i++)
-        {
-            if (rd.data[i] != val.data[i])
+            if (s_dev[i].addr == addr)
             {
-                ok = 0U;
-                log_e("LoRa configuration verification failed at byte %d", i);
-                break;
+                return &s_dev[i];
             }
-            log_i("LoRa configuration verification successful at byte %d", i);
+        }
+        else if (slot == NULL)
+        {
+            slot = &s_dev[i];
         }
     }
-    else {
-        ok = 0;
+
+    if (slot != NULL)
+    {
+        memset(slot, 0, sizeof(*slot));
+        slot->used = 1U;
+        slot->addr = addr;
     }
 
-    lora_cfg_mode_exit();
-
-    return ok;
+    return slot;
 }
 
-uint8_t app_lora_cfg_reg_verify(lora_reg_parm_cfg_t val, uint8_t len)
+const app_lora_dev_t *app_lora_dev_find(uint8_t addr)
 {
-    return lora_cfg_write_read_verify(val, len);
+    uint8_t i;
+
+    for (i = 0U; i < APP_LORA_DEV_MAX; i++)
+    {
+        if ((s_dev[i].used != 0U) && (s_dev[i].addr == addr))
+        {
+            return &s_dev[i];
+        }
+    }
+    return NULL;
 }
 
+const app_lora_dev_t *app_lora_dev_table(void)
+{
+    return s_dev;
+}
 
-/* lora 接收消息解析 */
-/* ---- 整帧校验通过后:功能码 switch 直接落地,长度不符/未知功能码一律丢弃 ---- */
+/* ACK 帧(§5.1):5A DST 07 (FUN|0x80) CORR CODE CRC */
+void app_lora_send_ack(uint8_t dst, uint8_t up_fun, uint8_t corr, uint8_t code)
+{
+    uint8_t f[LORA_FRAME_LEN_DATA];
+
+    f[LORA_OFS_HEAD] = LORA_FRAME_HEAD;
+    f[LORA_OFS_ADDR] = dst;
+    f[LORA_OFS_LEN]  = LORA_FRAME_LEN_DATA;
+    f[LORA_OFS_FUN]  = (uint8_t)(up_fun | LORA_FUN_ACK_MASK);
+    f[4]             = corr;
+    f[5]             = code;
+    f[6]             = lora_crc8_cal(f, (uint16_t)(sizeof(f) - 1U));
+
+    app_lora_send_bytes(f, (uint16_t)sizeof(f));
+}
+
+/* 点名命令(§5.2):5A DST 05 FUN CRC */
+void app_lora_query(uint8_t dst, uint8_t fun)
+{
+    uint8_t f[5U];
+
+    f[LORA_OFS_HEAD] = LORA_FRAME_HEAD;
+    f[LORA_OFS_ADDR] = dst;
+    f[LORA_OFS_LEN]  = 5U;
+    f[LORA_OFS_FUN]  = fun;
+    f[4]             = lora_crc8_cal(f, 4U);
+
+    app_lora_send_bytes(f, (uint16_t)sizeof(f));
+}
+
+/* ---- 整帧校验通过后:按功能码处理上行帧;ACK 由 APP_LORA_ACK_ENABLE 控制 ---- */
 static void lora_rx_parse(const uint8_t *f)
 {
-    uint8_t fun = f[2];
-    switch (fun)
-    {
-        case LORA_FUN_SIGNAL:
-            /* 处理信号功能码的逻辑 */
-            log_i("Signal received, %d", f[3]);
-            break;
-        case LORA_FUN_POWER:
-            /* 处理电源功能码的逻辑 */
-            log_i("Power received, %d", f[3]);
+    uint8_t len = f[LORA_OFS_LEN];
+    uint8_t src = f[LORA_OFS_ADDR];
+    uint8_t fun = f[LORA_OFS_FUN];
+    app_lora_dev_t *dev;
 
-            break;
-        default:
-            break;
+    /* 上行源地址不可能是广播地址:此时 ACK 无法精确指向设备,只能丢弃 */
+    if (src == LORA_ADDR_BROADCAST)
+    {
+        log_e("uplink: broadcast src addr, dropped (fun=0x%02X)", fun);
+        return;
     }
-    (void)f;
+
+    if ((fun != LORA_FUN_SIGNAL) && (fun != LORA_FUN_POWER))
+    {
+        log_w("uplink: unsupported fun=0x%02X from 0x%02X", fun, src);
+        return;
+    }
+
+    if (len != LORA_FRAME_LEN_DATA)
+    {
+#if APP_LORA_ACK_ENABLE
+        /* 长度不符:能取到 SEQ 就回非 0 码,让设备不必重发 */
+        if (len >= (LORA_OFS_DATA + 1U))
+        {
+            app_lora_send_ack(src, fun, f[LORA_OFS_DATA], LORA_ACK_CODE_BADLEN);
+        }
+#endif
+        log_e("uplink: bad len=%u (fun=0x%02X addr=0x%02X)", len, fun, src);
+        return;
+    }
+
+    dev = lora_dev_get(src);
+    if (dev == NULL)
+    {
+        log_e("uplink: dev table full, drop addr=0x%02X", src);
+        return;
+    }
+
+    if (fun == LORA_FUN_SIGNAL)
+    {
+        dev->sig       = f[LORA_OFS_DATA + 1U];
+        dev->sig_seq   = f[LORA_OFS_DATA];
+        dev->sig_valid = 1U;
+        dev->sig_tick  = HAL_GetTick();
+        log_i("SIG  dev=0x%02X seq=%u sig=0x%02X (%s)", src, dev->sig_seq, dev->sig,
+              (dev->sig == LORA_SIG_DONE) ? "done" : "undone");
+    }
+    else /* LORA_FUN_POWER */
+    {
+        dev->pwr       = f[LORA_OFS_DATA + 1U];
+        dev->pwr_seq   = f[LORA_OFS_DATA];
+        dev->pwr_valid = (dev->pwr != LORA_PWR_INVALID) ? 1U : 0U;
+        dev->pwr_tick  = HAL_GetTick();
+        if (dev->pwr_valid != 0U)
+        {
+            log_i("PWR  dev=0x%02X seq=%u pwr=%u%%", src, dev->pwr_seq, dev->pwr);
+        }
+        else
+        {
+            log_w("PWR  dev=0x%02X seq=%u invalid(0xFF)", src, dev->pwr_seq);
+        }
+    }
+
+    dev->rx_ok++;
+
+#if APP_LORA_ACK_ENABLE
+    /* §8.1:收到上行帧后在 100ms 内回 ACK(CODE=0 表示已正确接收) */
+    app_lora_send_ack(src, fun, f[LORA_OFS_DATA], LORA_ACK_CODE_OK);
+#endif
 }
 
-/* ---- 接收:找帧头 -> 按 LEN 收满 -> CRC 校验 -> 解析 ---- */
-static uint8_t  s_rx_buf[LORA_FRAME_BUF_MAX];
+/* ---- 接收:找帧头 -> 收够 LEN 字节 -> CRC 校验 -> 解析 ---- */
+static uint8_t  s_rx_buf[LORA_FRAME_MAX_LEN];
 static uint8_t  s_rx_idx;       /* 0 = 正在找帧头,其余为已收字节数 */
 static uint32_t s_rx_tick;      /* 最近一个字节的时刻,用于字节间超时 */
+static uint32_t s_crc_log_tick; /* CRC 错误日志上次打印时刻(限流用) */
+static uint8_t  s_crc_logged;   /* 是否已打印过 CRC 错误(限流用)     */
 
 /* 喂一个字节:无阻塞、无忙等,有多少吃多少 */
 static void lora_rx_byte(uint8_t b)
@@ -359,24 +235,55 @@ static void lora_rx_byte(uint8_t b)
     s_rx_buf[s_rx_idx] = b;
     s_rx_idx++;
 
-    if (s_rx_idx == 2U)                     /* 刚收完长度字节:先做范围检查 */
+    /* LEN 字节(偏移 LORA_OFS_LEN)还没收齐前不能做长度判断:
+     * 否则会读到缓冲区里上一帧残留的陈旧 LEN,把帧头+地址误判成整帧 */
+    if (s_rx_idx <= LORA_OFS_LEN)
     {
-        uint8_t len = s_rx_buf[1];
+        return;
+    }
 
-        if ((len < LORA_FRAME_MIN_LEN) || (len > (uint8_t)sizeof(s_rx_buf)))
+    if (s_rx_idx == (LORA_OFS_LEN + 1U))    /* 刚收完长度字节:先做范围检查 */
+    {
+        uint8_t len = s_rx_buf[LORA_OFS_LEN];
+
+        if ((len < LORA_FRAME_MIN_LEN) || (len > LORA_FRAME_MAX_LEN))
         {
             s_rx_idx = 0U;                  /* 长度非法:丢帧重找帧头 */
         }
         return;
     }
 
-    if (s_rx_idx == s_rx_buf[1])            /* 整帧收满:CRC 对才解析 */
+    if (s_rx_idx == s_rx_buf[LORA_OFS_LEN]) /* 整帧收满:CRC 对才解析 */
     {
-        uint8_t len = s_rx_buf[1];
+        uint8_t len = s_rx_buf[LORA_OFS_LEN];
 
         if (lora_crc8_cal(s_rx_buf, (uint16_t)(len - 1U)) == s_rx_buf[len - 1U])
         {
             lora_rx_parse(s_rx_buf);
+        }
+        else
+        {
+            /* CRC 失败:帧内容不可信,不新建条目,仅对已知设备做尽力归属 */
+            uint8_t a = s_rx_buf[LORA_OFS_ADDR];
+            uint8_t i;
+
+            for (i = 0U; i < APP_LORA_DEV_MAX; i++)
+            {
+                if ((s_dev[i].used != 0U) && (s_dev[i].addr == a))
+                {
+                    s_dev[i].crc_err++;
+                    break;
+                }
+            }
+
+            /* 限流打印:空口噪声可能连续触发,避免把 RTT 刷爆(计数不受影响) */
+            if ((s_crc_logged == 0U) ||
+                ((HAL_GetTick() - s_crc_log_tick) >= LORA_CRC_LOG_MS))
+            {
+                s_crc_logged   = 1U;
+                s_crc_log_tick = HAL_GetTick();
+                log_e("rx: crc error (len=%u, addr~0x%02X)", len, a);
+            }
         }
         s_rx_idx = 0U;
     }

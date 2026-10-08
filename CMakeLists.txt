@@ -52,6 +52,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Bsp/bsp_gpio.c
     App/app_lora.c
     App/app_lora_procotol.c
+    App/app_lora_config.c
     App/app_main.c
     ThirdLib/RTT/SEGGER_RTT.c
     ThirdLib/RTT/SEGGER_RTT_printf.c
