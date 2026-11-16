@@ -1,10 +1,10 @@
 /**
  * @file app_lora_procotol.c
  * @author Fariscooool (fariscooool@gmail.com)
- * @brief LoRa 协议 v1.5 主机侧实现:上行帧解析、按设备建表、ACK 应答、点名命令
- *        (样机阶段 ACK 由 APP_LORA_ACK_ENABLE 关闭,只做接收)
- * @version 0.2
- * @date 2026-10-09
+ * @brief LoRa 协议 v1.6 主机侧实现:上行快照帧解析、UID32 白名单过滤、
+ *        按设备建表、ACK 应答、点名命令
+ * @version 0.3
+ * @date 2026-10-10
  * 
  * @copyright Copyright (c) 2026
  * 
@@ -21,8 +21,8 @@
 #include "main.h"
 #include "LOG.h"
 
-/* 帧格式与协议常量定义见 app_lora_procotol.h(与 LoRa_Protocol_v1.5.md 一致):
- *   [0] HEAD=0x5A  [1] ADDR  [2] LEN  [3] FUN  [4..LEN-2] DATA  [LEN-1] CRC8
+/* 帧格式与协议常量定义见 app_lora_procotol.h(与 LoRa_Protocol_v1.6.md 一致):
+ *   [0] HEAD=0x5A  [1] ADDR  [2] LEN  [3] FUN  [4..7] UID32  [8..LEN-2] DATA  [LEN-1] CRC8
  */
 
 /*********************************
@@ -51,43 +51,30 @@ static uint8_t lora_crc8_cal(const uint8_t *data, uint16_t len)
 }
 
 /*==============================================================================
- * 主机侧:设备状态表 + ACK 应答 + 点名命令(§5 / §8)
+ * 主机侧:设备状态表(白名单) + ACK 应答 + 点名命令(§5 / §8)
  *============================================================================*/
 
 static app_lora_dev_t s_dev[APP_LORA_DEV_MAX];
 
-/* 查找设备条目;不存在则在空槽新建(表满返回 NULL) */
-static app_lora_dev_t *lora_dev_get(uint8_t addr)
+/* UID32 小端解析/打包(§2) */
+static uint32_t lora_uid32_get(const uint8_t *f)
 {
-    uint8_t i;
-    app_lora_dev_t *slot = NULL;
-
-    for (i = 0U; i < APP_LORA_DEV_MAX; i++)
-    {
-        if (s_dev[i].used != 0U)
-        {
-            if (s_dev[i].addr == addr)
-            {
-                return &s_dev[i];
-            }
-        }
-        else if (slot == NULL)
-        {
-            slot = &s_dev[i];
-        }
-    }
-
-    if (slot != NULL)
-    {
-        memset(slot, 0, sizeof(*slot));
-        slot->used = 1U;
-        slot->addr = addr;
-    }
-
-    return slot;
+    return ((uint32_t)f[LORA_OFS_UID32]) |
+           ((uint32_t)f[LORA_OFS_UID32 + 1U] << 8) |
+           ((uint32_t)f[LORA_OFS_UID32 + 2U] << 16) |
+           ((uint32_t)f[LORA_OFS_UID32 + 3U] << 24);
 }
 
-const app_lora_dev_t *app_lora_dev_find(uint8_t addr)
+static void lora_uid32_put(uint8_t *f, uint32_t uid32)
+{
+    f[LORA_OFS_UID32]      = (uint8_t)(uid32 & 0xFFU);
+    f[LORA_OFS_UID32 + 1U] = (uint8_t)((uid32 >> 8) & 0xFFU);
+    f[LORA_OFS_UID32 + 2U] = (uint8_t)((uid32 >> 16) & 0xFFU);
+    f[LORA_OFS_UID32 + 3U] = (uint8_t)((uid32 >> 24) & 0xFFU);
+}
+
+/* 仅按地址查已登记设备,不新建 */
+static app_lora_dev_t *lora_dev_lookup(uint8_t addr)
 {
     uint8_t i;
 
@@ -101,113 +88,191 @@ const app_lora_dev_t *app_lora_dev_find(uint8_t addr)
     return NULL;
 }
 
+/* 新建条目并绑定 (addr, uid32);表满返回 NULL */
+static app_lora_dev_t *lora_dev_alloc(uint8_t addr, uint32_t uid32)
+{
+    uint8_t i;
+
+    for (i = 0U; i < APP_LORA_DEV_MAX; i++)
+    {
+        if (s_dev[i].used == 0U)
+        {
+            memset(&s_dev[i], 0, sizeof(s_dev[i]));
+            s_dev[i].used  = 1U;
+            s_dev[i].addr  = addr;
+            s_dev[i].uid32 = uid32;
+            return &s_dev[i];
+        }
+    }
+    return NULL;
+}
+
+/* 预先登记白名单条目(§8.1);同 addr 重复登记则覆盖 uid32 */
+void app_lora_dev_bind(uint8_t addr, uint32_t uid32)
+{
+    app_lora_dev_t *dev = lora_dev_lookup(addr);
+
+    if (dev == NULL)
+    {
+        dev = lora_dev_alloc(addr, uid32);
+    }
+    else
+    {
+        dev->uid32 = uid32;
+    }
+
+    if (dev == NULL)
+    {
+        log_e("dev bind: table full, addr=0x%02X dropped", addr);
+        return;
+    }
+
+    log_i("dev bound: addr=0x%02X uid32=0x%08X", addr, (unsigned)uid32);
+}
+
+const app_lora_dev_t *app_lora_dev_find(uint8_t addr)
+{
+    return (const app_lora_dev_t *)lora_dev_lookup(addr);
+}
+
 const app_lora_dev_t *app_lora_dev_table(void)
 {
     return s_dev;
 }
 
-/* ACK 帧(§5.1):5A DST 07 (FUN|0x80) CORR CODE CRC */
-void app_lora_send_ack(uint8_t dst, uint8_t up_fun, uint8_t corr, uint8_t code)
+/* ACK 帧(§5.1):5A DST 0B 83 UID32(4) CORR CODE CRC
+ * DST/UID32 必须是目标设备自身的值:填广播值(0xFF/0x00000000)设备一律忽略 */
+void app_lora_send_ack(uint8_t dst, uint32_t uid32, uint8_t corr, uint8_t code)
 {
-    uint8_t f[LORA_FRAME_LEN_DATA];
+    uint8_t f[LORA_FRAME_LEN_ACK];
 
     f[LORA_OFS_HEAD] = LORA_FRAME_HEAD;
     f[LORA_OFS_ADDR] = dst;
-    f[LORA_OFS_LEN]  = LORA_FRAME_LEN_DATA;
-    f[LORA_OFS_FUN]  = (uint8_t)(up_fun | LORA_FUN_ACK_MASK);
-    f[4]             = corr;
-    f[5]             = code;
-    f[6]             = lora_crc8_cal(f, (uint16_t)(sizeof(f) - 1U));
+    f[LORA_OFS_LEN]  = LORA_FRAME_LEN_ACK;
+    f[LORA_OFS_FUN]  = LORA_FUN_ACK;
+    lora_uid32_put(f, uid32);
+    f[LORA_OFS_ACK_CORR] = corr;
+    f[LORA_OFS_ACK_CODE] = code;
+    f[LORA_FRAME_LEN_ACK - 1U] =
+        lora_crc8_cal(f, (uint16_t)(LORA_FRAME_LEN_ACK - 1U));
 
     app_lora_send_bytes(f, (uint16_t)sizeof(f));
 }
 
-/* 点名命令(§5.2):5A DST 05 FUN CRC */
-void app_lora_query(uint8_t dst, uint8_t fun)
+/* 点名命令(§5.2):5A DST 09 FUN UID32(4) CRC
+ * 定向:填目标设备 addr + uid32;广播:0xFF + 0x00000000 */
+void app_lora_query(uint8_t dst, uint32_t uid32, uint8_t fun)
 {
-    uint8_t f[5U];
+    uint8_t f[LORA_FRAME_LEN_CMD];
 
     f[LORA_OFS_HEAD] = LORA_FRAME_HEAD;
     f[LORA_OFS_ADDR] = dst;
-    f[LORA_OFS_LEN]  = 5U;
+    f[LORA_OFS_LEN]  = LORA_FRAME_LEN_CMD;
     f[LORA_OFS_FUN]  = fun;
-    f[4]             = lora_crc8_cal(f, 4U);
+    lora_uid32_put(f, uid32);
+    f[LORA_FRAME_LEN_CMD - 1U] =
+        lora_crc8_cal(f, (uint16_t)(LORA_FRAME_LEN_CMD - 1U));
 
     app_lora_send_bytes(f, (uint16_t)sizeof(f));
 }
 
-/* ---- 整帧校验通过后:按功能码处理上行帧;ACK 由 APP_LORA_ACK_ENABLE 控制 ---- */
-static void lora_rx_parse(const uint8_t *f)
+/* ---- 快照帧(0x03):CRC 已通过,白名单校验 -> 更新设备表 -> 回 ACK(§8) ---- */
+static void lora_rx_snapshot(const uint8_t *f)
 {
-    uint8_t len = f[LORA_OFS_LEN];
-    uint8_t src = f[LORA_OFS_ADDR];
-    uint8_t fun = f[LORA_OFS_FUN];
+    uint8_t  len = f[LORA_OFS_LEN];
+    uint8_t  src = f[LORA_OFS_ADDR];
+    uint8_t  seq = f[LORA_OFS_SEQ];
+    uint8_t  sig = f[LORA_OFS_SIG];
+    uint8_t  pwr = f[LORA_OFS_PWR];
+    uint32_t uid = lora_uid32_get(f);
     app_lora_dev_t *dev;
 
-    /* 上行源地址不可能是广播地址:此时 ACK 无法精确指向设备,只能丢弃 */
-    if (src == LORA_ADDR_BROADCAST)
+    /* 上行源地址/UID32 不可能是广播值:此时 ACK 无法精确指向设备,只能丢弃 */
+    if ((src == LORA_ADDR_BROADCAST) || (uid == LORA_UID32_BROADCAST))
     {
-        log_e("uplink: broadcast src addr, dropped (fun=0x%02X)", fun);
+        log_e("uplink: illegal identity src=0x%02X uid32=0x%08X, dropped", src, (unsigned)uid);
         return;
     }
 
-    if ((fun != LORA_FUN_SIGNAL) && (fun != LORA_FUN_POWER))
-    {
-        log_w("uplink: unsupported fun=0x%02X from 0x%02X", fun, src);
-        return;
-    }
-
-    if (len != LORA_FRAME_LEN_DATA)
+    if (len != LORA_FRAME_LEN_SNAPSHOT)
     {
 #if APP_LORA_ACK_ENABLE
-        /* 长度不符:能取到 SEQ 就回非 0 码,让设备不必重发 */
-        if (len >= (LORA_OFS_DATA + 1U))
-        {
-            app_lora_send_ack(src, fun, f[LORA_OFS_DATA], LORA_ACK_CODE_BADLEN);
-        }
+        /* 长度不符:SEQ/UID32 仍可取出,回非 0 码让设备不必重发 */
+        app_lora_send_ack(src, uid, seq, LORA_ACK_CODE_BADLEN);
 #endif
-        log_e("uplink: bad len=%u (fun=0x%02X addr=0x%02X)", len, fun, src);
+        log_e("uplink: bad len=%u (fun=0x%02X addr=0x%02X)", len, f[LORA_OFS_FUN], src);
         return;
     }
 
-    dev = lora_dev_get(src);
-    if (dev == NULL)
+    dev = lora_dev_lookup(src);
+    if (dev != NULL)
     {
-        log_e("uplink: dev table full, drop addr=0x%02X", src);
-        return;
-    }
-
-    if (fun == LORA_FUN_SIGNAL)
-    {
-        dev->sig       = f[LORA_OFS_DATA + 1U];
-        dev->sig_seq   = f[LORA_OFS_DATA];
-        dev->sig_valid = 1U;
-        dev->sig_tick  = HAL_GetTick();
-        log_i("SIG  dev=0x%02X seq=%u sig=0x%02X (%s)", src, dev->sig_seq, dev->sig,
-              (dev->sig == LORA_SIG_DONE) ? "done" : "undone");
-    }
-    else /* LORA_FUN_POWER */
-    {
-        dev->pwr       = f[LORA_OFS_DATA + 1U];
-        dev->pwr_seq   = f[LORA_OFS_DATA];
-        dev->pwr_valid = (dev->pwr != LORA_PWR_INVALID) ? 1U : 0U;
-        dev->pwr_tick  = HAL_GetTick();
-        if (dev->pwr_valid != 0U)
+        /* §8.1 白名单:addr 已登记但 UID32 不符 -> 不是本套设备,过滤丢弃 */
+        if (dev->uid32 != uid)
         {
-            log_i("PWR  dev=0x%02X seq=%u pwr=%u%%", src, dev->pwr_seq, dev->pwr);
-        }
-        else
-        {
-            log_w("PWR  dev=0x%02X seq=%u invalid(0xFF)", src, dev->pwr_seq);
+            dev->filtered++;
+            log_w("uplink: uid32 mismatch, filtered (addr=0x%02X got=0x%08X want=0x%08X)",
+                  src, (unsigned)uid, (unsigned)dev->uid32);
+            return;
         }
     }
+    else
+    {
+        /* 首次上到:用帧内的 (addr, uid32) 绑定白名单 */
+        dev = lora_dev_alloc(src, uid);
+        if (dev == NULL)
+        {
+            log_e("uplink: dev table full, drop addr=0x%02X", src);
+            return;
+        }
+        log_i("dev bound: addr=0x%02X uid32=0x%08X", src, (unsigned)uid);
+    }
 
+    /* §8.4 重发容错:同一数据可能带不同 SEQ 到达多次,按"最后一次为准"覆盖 */
+    dev->sig       = sig;
+    dev->sig_valid = 1U;
+    dev->pwr       = pwr;
+    dev->pwr_valid = (pwr != LORA_PWR_INVALID) ? 1U : 0U;
+    dev->last_seq  = seq;
+    dev->last_tick = HAL_GetTick();
     dev->rx_ok++;
 
+    if (dev->pwr_valid != 0U)
+    {
+        log_i("SNAP dev=0x%02X seq=%u sig=0x%02X (%s) pwr=%u%%", src, seq, sig,
+              (sig == LORA_SIG_DONE) ? "done" : "undone", pwr);
+    }
+    else
+    {
+        log_w("SNAP dev=0x%02X seq=%u sig=0x%02X (%s) pwr=invalid(0xFF)", src, seq, sig,
+              (sig == LORA_SIG_DONE) ? "done" : "undone");
+    }
+
 #if APP_LORA_ACK_ENABLE
-    /* §8.1:收到上行帧后在 100ms 内回 ACK(CODE=0 表示已正确接收) */
-    app_lora_send_ack(src, fun, f[LORA_OFS_DATA], LORA_ACK_CODE_OK);
+    /* §8.2:收到快照帧后 ≤100ms 内回 ACK,CODE=0;CORR 原样回填收到的 SEQ */
+    app_lora_send_ack(src, uid, seq, LORA_ACK_CODE_OK);
 #endif
+}
+
+/* ---- 整帧 CRC 通过后:按功能码分发 ---- */
+static void lora_rx_parse(const uint8_t *f)
+{
+    uint8_t fun = f[LORA_OFS_FUN];
+
+    if (fun == LORA_FUN_SNAPSHOT)
+    {
+        lora_rx_snapshot(f);
+        return;
+    }
+
+    /* ACK/点名命令都是主机发出的下行帧,主机侧收到说明是别的套在通信,忽略 */
+    if ((fun == LORA_FUN_ACK) || (fun == LORA_FUN_GET_POWER) || (fun == LORA_FUN_GET_SIGNAL))
+    {
+        log_w("rx: downlink fun=0x%02X ignored", fun);
+        return;
+    }
+
+    log_w("rx: unsupported fun=0x%02X from 0x%02X", fun, f[LORA_OFS_ADDR]);
 }
 
 /* ---- 接收:找帧头 -> 收够 LEN 字节 -> CRC 校验 -> 解析 ---- */
@@ -265,15 +330,11 @@ static void lora_rx_byte(uint8_t b)
         {
             /* CRC 失败:帧内容不可信,不新建条目,仅对已知设备做尽力归属 */
             uint8_t a = s_rx_buf[LORA_OFS_ADDR];
-            uint8_t i;
+            app_lora_dev_t *d = lora_dev_lookup(a);
 
-            for (i = 0U; i < APP_LORA_DEV_MAX; i++)
+            if (d != NULL)
             {
-                if ((s_dev[i].used != 0U) && (s_dev[i].addr == a))
-                {
-                    s_dev[i].crc_err++;
-                    break;
-                }
+                d->crc_err++;
             }
 
             /* 限流打印:空口噪声可能连续触发,避免把 RTT 刷爆(计数不受影响) */
