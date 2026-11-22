@@ -143,7 +143,7 @@ uint8_t app_lora_cfg_write(lora_reg_parm_cfg_t cfg)
     /* 写指令:有的固件会回显(C0 + 参数),有的不回;不管哪种都读进来打印,
      * 方便对照。写是否真正生效由 app_lora_cfg_reg_verify() 的读回比对判定。 */
     {
-        (void)lora_cfg_transaction(tx, (uint8_t)(1U + APP_LORA_CFG_DATA_MAX), NULL, 0);
+    (void)lora_cfg_transaction(tx, (uint8_t)(1U + APP_LORA_CFG_DATA_MAX), NULL, 0);
     }
     ok = 1U;
     lora_cfg_mode_exit();
@@ -182,12 +182,12 @@ uint8_t app_lora_cfg_read(lora_reg_parm_cfg_t *buf)
 
     if (got >= (1U + APP_LORA_CFG_DATA_MAX))
     {
-        for (i = 0U; i < APP_LORA_CFG_DATA_MAX; i++)
-        {
+    for (i = 0U; i < APP_LORA_CFG_DATA_MAX; i++)
+    {
             buf->data[i] = rx[1U + i];
-        }
-        ok = 1U;
     }
+        ok = 1U;
+}
     else
     {
         log_e("cfg read: bad reply.");
@@ -218,7 +218,7 @@ static uint8_t lora_cfg_write_read_verify(const lora_reg_parm_cfg_t val)
         tx[1U + i] = val.data[i];
     }
     if (lora_cfg_transaction(tx, (uint8_t)(1U + APP_LORA_CFG_DATA_MAX), NULL, 0) != 0U)
-    {
+        {
         ok = 1U;
     }
 

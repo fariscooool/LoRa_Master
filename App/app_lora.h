@@ -174,11 +174,6 @@ uint8_t app_lora_peek_byte(uint8_t *data);
  */
 uint8_t app_lora_rx_available(void);
 
-/**
- * @brief 获取 LoRa 模块当前状态
- * @return LoRa 模块当前状态
-**/
-lora_state_t app_lora_get_status(void);
 
 #ifdef __cplusplus
 }

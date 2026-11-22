@@ -67,6 +67,14 @@ void lora_uart_rx_event(uint16_t size);
  */
 void lora_uart_rx_restart(void);
 
+/**
+ * @brief 补启动接收(主循环调用)
+ * @note  中断里重启接收时若 HAL 的 uart 锁被主线程的发送占用,重启会失败;
+ *        这里在主线程里检测并补一次,避免接收此后永久失效。
+ *        建议每个主循环周期调用一次。
+ */
+void lora_uart_rx_poll(void);
+
 #ifdef __cplusplus
 }
 #endif

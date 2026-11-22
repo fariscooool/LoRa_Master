@@ -40,5 +40,8 @@
        * 可选值: "raw" / "parsed" / "both" / "vscode" */
       // "showDevDebugOutput": "parsed"
     }
-  ]
+  ],
+  "setupCommands": [
+    { "description": "Set charset to auto", "text": "set host-charset auto" }
+]
 }

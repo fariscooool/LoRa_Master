@@ -152,7 +152,6 @@ uid32 = h
 
 | 参数（宏） | 默认 | 说明 |
 |---|---|---|
-| `APP_LORA_ACK_ENABLE` | 0（样机）/ 1（正式） | 0=发出即结束（不等 ACK）；1=完整交付流程 |
 | `APP_LORA_ACK_TIMEOUT_MS` | 300ms | 等 ACK 窗口（从帧发出后开始计） |
 | `APP_LORA_RETRY_MAX` | 2 | 最多重发次数（总发送 ≤ 1+2 次） |
 | `APP_LORA_RETRY_BACKOFF_MS` | 50ms | 重发前退避（错开碰撞） |

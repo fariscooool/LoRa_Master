@@ -196,10 +196,10 @@ static void lora_rx_snapshot(const uint8_t *f)
 
     if (len != LORA_FRAME_LEN_SNAPSHOT)
     {
-#if APP_LORA_ACK_ENABLE
+
         /* 长度不符:SEQ/UID32 仍可取出,回非 0 码让设备不必重发 */
         app_lora_send_ack(src, uid, seq, LORA_ACK_CODE_BADLEN);
-#endif
+
         log_e("uplink: bad len=%u (fun=0x%02X addr=0x%02X)", len, f[LORA_OFS_FUN], src);
         return;
     }
@@ -215,6 +215,8 @@ static void lora_rx_snapshot(const uint8_t *f)
                   src, (unsigned)uid, (unsigned)dev->uid32);
             return;
         }
+
+        /* 已登记的不用执行操作，后续会确认内容后发送ACK */
     }
     else
     {
@@ -248,16 +250,20 @@ static void lora_rx_snapshot(const uint8_t *f)
               (sig == LORA_SIG_DONE) ? "done" : "undone");
     }
 
-#if APP_LORA_ACK_ENABLE
     /* §8.2:收到快照帧后 ≤100ms 内回 ACK,CODE=0;CORR 原样回填收到的 SEQ */
     app_lora_send_ack(src, uid, seq, LORA_ACK_CODE_OK);
-#endif
+
 }
 
 /* ---- 整帧 CRC 通过后:按功能码分发 ---- */
 static void lora_rx_parse(const uint8_t *f)
 {
     uint8_t fun = f[LORA_OFS_FUN];
+
+    if (fun == LORA_FUN_MATCH)
+    {
+        /* 配对方式需要另行商讨，配对做完后可以提测。 */
+    }
 
     if (fun == LORA_FUN_SNAPSHOT)
     {
@@ -266,7 +272,7 @@ static void lora_rx_parse(const uint8_t *f)
     }
 
     /* ACK/点名命令都是主机发出的下行帧,主机侧收到说明是别的套在通信,忽略 */
-    if ((fun == LORA_FUN_ACK) || (fun == LORA_FUN_GET_POWER) || (fun == LORA_FUN_GET_SIGNAL))
+    if (fun == LORA_FUN_ACK)
     {
         log_w("rx: downlink fun=0x%02X ignored", fun);
         return;
@@ -287,27 +293,29 @@ static void lora_rx_byte(uint8_t b)
 {
     s_rx_tick = HAL_GetTick();
 
-    if (s_rx_idx == 0U)                     /* 找帧头:非帧头字节直接丢 */
+    // 1、找帧头
+    if(s_rx_idx == 0)
     {
-        if (b == LORA_FRAME_HEAD)
+        if(b == LORA_FRAME_HEAD)
         {
             s_rx_buf[0] = b;
-            s_rx_idx    = 1U;
+            s_rx_idx = 1U;
         }
         return;
     }
 
+    //读取后续数据
     s_rx_buf[s_rx_idx] = b;
     s_rx_idx++;
 
-    /* LEN 字节(偏移 LORA_OFS_LEN)还没收齐前不能做长度判断:
-     * 否则会读到缓冲区里上一帧残留的陈旧 LEN,把帧头+地址误判成整帧 */
+    /* LEN 字节被找到之前不会执行后续操作 */
     if (s_rx_idx <= LORA_OFS_LEN)
     {
         return;
     }
 
-    if (s_rx_idx == (LORA_OFS_LEN + 1U))    /* 刚收完长度字节:先做范围检查 */
+    /* 刚收完长度字节:要对数据长度做范围检查 */
+    if (s_rx_idx == (LORA_OFS_LEN + 1U))    
     {
         uint8_t len = s_rx_buf[LORA_OFS_LEN];
 
@@ -318,7 +326,8 @@ static void lora_rx_byte(uint8_t b)
         return;
     }
 
-    if (s_rx_idx == s_rx_buf[LORA_OFS_LEN]) /* 整帧收满:CRC 对才解析 */
+    /* 整帧收满后，先做CRC，校验完成后再做解析 */
+    if (s_rx_idx == s_rx_buf[LORA_OFS_LEN]) 
     {
         uint8_t len = s_rx_buf[LORA_OFS_LEN];
 
@@ -354,11 +363,6 @@ void app_lora_process(void)
 {
     uint8_t b;
 
-    /* 无唤醒事件 / 正在发送:本轮不拆包 */
-    if (app_lora_get_status() != LORA_IDLE)
-    {
-        return;
-    }
 
     /* 1) 收:把接收 FIFO 里的字节全部喂给状态机(非阻塞,有多少吃多少) */
     while (app_lora_read_byte(&b) != 0U)

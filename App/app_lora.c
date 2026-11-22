@@ -60,7 +60,7 @@ typedef struct {
 
     lora_mode_t current_mode;
 
-    lora_state_t current_state;
+    // lora_state_t current_state;
     
     uint8_t lora_initialized;
     
@@ -90,10 +90,9 @@ void app_lora_init(void)
     //UART+GPIO已集中完成初始化
 
     lora.current_mode = LORA_MODE_NORMAL;
-    lora.current_state = LORA_IDLE;
+    // lora.current_state = LORA_IDLE;
     app_lora_set_mode(LORA_MODE_NORMAL);
 
-    
 }
 
 void app_lora_set_mode(lora_mode_t mode)
@@ -157,9 +156,4 @@ uint8_t app_lora_peek_byte(uint8_t *data)
 uint8_t app_lora_rx_available(void)
 {
     return lora_drv.lora_rx_available();
-}
-
-lora_state_t app_lora_get_status(void)
-{
-    return lora.current_state;
 }

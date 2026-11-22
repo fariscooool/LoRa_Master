@@ -33,6 +33,10 @@ static uint8_t   s_rx_dma[LORA_RX_DMA_SIZE];     /* DMA 接收缓冲 */
 static uint8_t   s_rx_fifo[LORA_RX_FIFO_SIZE];   /* 内部 FIFO 存储区 */
 static volatile uint16_t s_rx_head = 0;          /* FIFO 写指针(中断写) */
 static volatile uint16_t s_rx_tail = 0;          /* FIFO 读指针         */
+static volatile uint8_t  s_rx_rearm_pending = 0; /* 重启接收失败,待主循环补一次 */
+
+/* 调试观测:接收重启失败次数。非 0 就说明发生过"该重启时被 HAL 锁挡住"的竞争 */
+volatile uint32_t g_lora_rx_rearm_fail;
 
 /*==============================================================================
  * 内部函数
@@ -48,10 +52,36 @@ static void lora_fifo_push(uint8_t byte)
     }
 }
 
-/* 启动一次 DMA“收到空闲/收满”接收 */
+/* 启动一次 DMA“收到空闲/收满”接收
+ *
+ * ⚠ HAL_UARTEx_ReceiveToIdle_DMA() 进来第一件事就是 __HAL_LOCK(huart),
+ *   而主线程的 HAL_UART_Transmit() 在整帧发送期间都持有这把锁(9600bps 下
+ *   约 1ms/字节)。如果 IDLE 事件正好落在这段时间里,本函数会直接返回
+ *   HAL_BUSY 并且 **不会启动 DMA** —— 之后空中的数据只能堆在 1 字节的
+ *   RDR 里被 ORE 冲掉,FIFO 再也进不了数据(表现为"突然永久收不到")。
+ *   RxState 由 HAL 先置 READY 才会调回调,所以这里失败必须记下来,
+ *   等锁释放后由 lora_uart_rx_poll() 补启动。 */
 static void lora_rx_start(void)
 {
-    (void)HAL_UARTEx_ReceiveToIdle_DMA(&huart6, s_rx_dma, LORA_RX_DMA_SIZE);
+    if (HAL_UARTEx_ReceiveToIdle_DMA(&huart6, s_rx_dma, LORA_RX_DMA_SIZE) != HAL_OK)
+    {
+        s_rx_rearm_pending = 1U;
+        g_lora_rx_rearm_fail++;
+    }
+    else
+    {
+        s_rx_rearm_pending = 0U;
+    }
+}
+
+/* 主循环里补启动接收(中断里因 HAL 锁失败时用)
+ * 只在"当前确实没有在接收"时才补,避免打断一次正在进行的接收 */
+void lora_uart_rx_poll(void)
+{
+    if ((s_rx_rearm_pending != 0U) && (huart6.RxState == HAL_UART_STATE_READY))
+    {
+        lora_rx_start();
+    }
 }
 
 /* 等待 DMA 发送真正结束(gState=READY 且 UART 移位寄存器发完 TC) */
@@ -96,11 +126,16 @@ void lora_send(const uint8_t *data, uint16_t len)
         (HAL_UART_Transmit_DMA(&huart6, data, len) == HAL_OK))
     {
         lora_wait_tx_done(&huart6);  /* 阻塞等待发完(进低功耗前总线空闲) */
-        return;
+    }
+    else
+    {
+        /* 没有 TX DMA 通道 / DMA 启动失败:退化为阻塞发送,保证这一帧能发出去 */
+        (void)HAL_UART_Transmit(&huart6, data, len, 200U);
     }
 
-    /* 没有 TX DMA 通道 / DMA 启动失败:退化为阻塞发送,保证这一帧能发出去 */
-    (void)HAL_UART_Transmit(&huart6, data, len, 200U);
+    /* 发送期间 HAL 持有 uart 锁,这段时间进来的 IDLE 事件会让接收重启失败;
+     * 到这里锁已释放,顺手把接收补起来(否则会一直收不到) */
+    lora_uart_rx_poll();
 }
 
 uint32_t lora_rx_available(void)

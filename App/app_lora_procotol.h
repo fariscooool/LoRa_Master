@@ -36,8 +36,6 @@ typedef struct
  *   5A SRC 0C 03 UID32(4) SEQ SIG PWR CRC
  * 下行 ACK 帧(0x83,11 字节):
  *   5A DST 0B 83 UID32(4) CORR CODE CRC
- * 下行点名命令(0x10/0x11,9 字节):
- *   5A DST 09 FUN UID32(4) CRC
  *============================================================================*/
 #define LORA_FRAME_HEAD       0x5AU  /* 帧头                  */
 #define LORA_FRAME_MIN_LEN    9U     /* 最小合法帧长          */
@@ -66,9 +64,8 @@ typedef struct
 
 /* 功能码 */
 #define LORA_FUN_SNAPSHOT     0x03U  /* 上行状态快照:UID32 + SEQ + SIG + PWR  */
+#define LORA_FUN_MATCH        0x04U  /* 上行状态快照:出场匹配用 */
 #define LORA_FUN_ACK          0x83U  /* 下行 ACK:UID32 + CORR + CODE          */
-#define LORA_FUN_GET_POWER    0x10U  /* 下行点名取电量                        */
-#define LORA_FUN_GET_SIGNAL   0x11U  /* 下行点名取信号                        */
 
 /* ACK 结果码(CODE) */
 #define LORA_ACK_CODE_OK      0x00U  /* 主机已正确接收            */
@@ -91,7 +88,7 @@ typedef struct
 #define LORA_CRC_LOG_MS       1000U
 
 /* 主机侧设备表容量(按实际节点数调整) */
-#define APP_LORA_DEV_MAX      16U
+#define APP_LORA_DEV_MAX      3U
 
 /**
  * @brief 主机侧按设备维护的状态表条目
@@ -125,16 +122,6 @@ typedef struct
 void app_lora_process(void);
 
 // LoRa 协议 v1.6 主机侧接口================================
-/*==============================================================================
- * 编译开关
- *============================================================================*/
-/**
- * @brief ACK 应答总开关(§8.2)
- *   1 = 收到快照帧后立即回 ACK(协议要求 ≤100ms 内),设备据此结束本轮
- *   0 = 只收不应答:解析上行帧、更新设备表,但不回 ACK(样机排查用)
- * @note  关闭的只是"自动应答",app_lora_send_ack() 本身仍保留,便于随时打开
- */
-#define APP_LORA_ACK_ENABLE   1
 
 /**
  * @brief 发送 ACK 帧(§5.1,11 字节)
